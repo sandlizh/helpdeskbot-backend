@@ -11,7 +11,6 @@ app = Flask(__name__)
 CORS(app, origins="*")
 
 DB_PATH = "helpdeskbot.db"
-
 MIAMI_EMAIL_REGEX = r"^[a-z][a-z0-9]{2,24}@miamioh\.edu$"
 
 
@@ -36,6 +35,12 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+
+
+# ✅ THIS IS THE CRITICAL FIX FOR RENDER + GUNICORN
+@app.before_first_request
+def setup_db():
+    init_db()
 
 
 # ---------------- ICAL LOGIC ---------------- #
@@ -65,7 +70,8 @@ def count_events_this_week(ical_url):
 
 @app.route("/api/register", methods=["POST"])
 def register():
-    data = request.get_json()
+    data = request.get_json() or {}
+
     email = data.get("email", "").strip().lower()
     password = data.get("password", "")
     ical_url = data.get("ical_url", "").strip()
@@ -96,7 +102,8 @@ def register():
 
 @app.route("/api/login", methods=["POST"])
 def login():
-    data = request.get_json()
+    data = request.get_json() or {}
+
     email = data.get("email", "").strip().lower()
     password = data.get("password", "")
 
@@ -114,7 +121,8 @@ def login():
 
 @app.route("/api/assignments/week", methods=["POST"])
 def assignments_week():
-    data = request.get_json()
+    data = request.get_json() or {}
+
     email = data.get("email", "").strip().lower()
 
     conn = get_db()
@@ -133,8 +141,8 @@ def assignments_week():
         return jsonify({"error": "Failed to read calendar"}), 500
 
 
-# ---------------- STARTUP ---------------- #
+# ---------------- LOCAL ONLY ---------------- #
 
 if __name__ == "__main__":
-    init_db()
-    app.run(debug=True)
+    init_db()            # local DB setup
+    app.run(debug=True)  # local dev server
