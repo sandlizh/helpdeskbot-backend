@@ -37,10 +37,8 @@ def init_db():
     conn.close()
 
 
-# ✅ THIS IS THE CRITICAL FIX FOR RENDER + GUNICORN
-@app.before_first_request
-def setup_db():
-    init_db()
+# ✅ Run this at import time (works locally AND on Render/Gunicorn)
+init_db()
 
 
 # ---------------- ICAL LOGIC ---------------- #
@@ -144,5 +142,6 @@ def assignments_week():
 # ---------------- LOCAL ONLY ---------------- #
 
 if __name__ == "__main__":
-    init_db()            # local DB setup
-    app.run(debug=True)  # local dev server
+    # For local testing (already initialized above, but safe to call again)
+    init_db()
+    app.run(debug=True)
