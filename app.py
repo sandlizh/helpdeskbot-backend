@@ -1,11 +1,18 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import sqlite3
+from werkzeug.security import generate_password_hash, check_password_hash
+import re
 from datetime import datetime, timedelta
 import requests
 from icalendar import Calendar
 
 app = Flask(__name__)
+CORS(app, origins="*")
+
 DB_PATH = "helpdeskbot.db"
+
+MIAMI_EMAIL_REGEX = r"^[a-z][a-z0-9]{2,24}@miamioh\.edu$"
 
 
 # ---------------- DATABASE ---------------- #
@@ -17,7 +24,6 @@ def get_db():
 
 
 def init_db():
-    """Create the users table if it doesn't exist, using the schema you already have."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
@@ -25,9 +31,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
-            ical_url TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
+            ical_url TEXT NOT NULL
+        );
     """)
     conn.commit()
     conn.close()
@@ -36,60 +41,81 @@ def init_db():
 # ---------------- ICAL LOGIC ---------------- #
 
 def count_events_this_week(ical_url):
-    """Return number of calendar events for Monday–Sunday of this week."""
     resp = requests.get(ical_url)
     resp.raise_for_status()
+
     cal = Calendar.from_ical(resp.content)
 
     today = datetime.now().date()
-    monday = today - timedelta(days=today.weekday())  # Monday
-    sunday = monday + timedelta(days=6)               # Sunday
+    monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
 
     count = 0
     for component in cal.walk():
         if component.name == "VEVENT":
             dtstart = component.get("dtstart").dt
-            date = dtstart.date() if hasattr(dtstart, "date") else dtstart
-            if monday <= date <= sunday:
+            event_date = dtstart.date() if hasattr(dtstart, "date") else dtstart
+            if monday <= event_date <= sunday:
                 count += 1
+
     return count
 
 
-# ---------------- API ENDPOINTS ---------------- #
+# ---------------- API ROUTES ---------------- #
 
 @app.route("/api/register", methods=["POST"])
 def register():
-    """
-    Create/update a user with email + password + iCal URL.
-    Uses columns: email, password_hash, ical_url (to match your existing DB).
-    """
-    data = request.get_json(silent=True) or {}
-    email = data.get("email")
-    password = data.get("password")
-    ical = data.get("ical_url")
+    data = request.get_json()
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+    ical_url = data.get("ical_url", "").strip()
 
-    if not email or not password or not ical:
-        return jsonify({"error": "email, password, and ical_url are required"}), 400
+    if not re.match(MIAMI_EMAIL_REGEX, email):
+        return jsonify({"error": "Invalid Miami email"}), 400
+
+    if not password or not ical_url:
+        return jsonify({"error": "Missing required fields"}), 400
+
+    password_hash = generate_password_hash(password)
 
     conn = get_db()
     cur = conn.cursor()
-    # REPLACE will overwrite existing row with same email
-    cur.execute(
-        "REPLACE INTO users (email, password_hash, ical_url) VALUES (?, ?, ?)",
-        (email, password, ical)
-    )
-    conn.commit()
+    try:
+        cur.execute(
+            "INSERT INTO users (email, password_hash, ical_url) VALUES (?, ?, ?)",
+            (email, password_hash, ical_url)
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"error": "Email already registered"}), 400
+
+    conn.close()
+    return jsonify({"message": "Account created"}), 201
+
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.get_json()
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE email = ?", (email,))
+    user = cur.fetchone()
     conn.close()
 
-    return jsonify({"status": "ok"})
+    if not user or not check_password_hash(user["password_hash"], password):
+        return jsonify({"error": "Invalid login"}), 401
+
+    return jsonify({"message": "Login successful"}), 200
 
 
-@app.route("/api/assignments/week", methods=["GET"])
+@app.route("/api/assignments/week", methods=["POST"])
 def assignments_week():
-    """Return the count of events for this week for the given email."""
-    email = request.args.get("email")
-    if not email:
-        return jsonify({"error": "email query parameter is required"}), 400
+    data = request.get_json()
+    email = data.get("email", "").strip().lower()
 
     conn = get_db()
     cur = conn.cursor()
@@ -97,23 +123,18 @@ def assignments_week():
     row = cur.fetchone()
     conn.close()
 
-    if not row or not row["ical_url"]:
-        return jsonify({"error": "email not found or no iCal URL stored"}), 404
-
-    ical_url = row["ical_url"]
+    if not row:
+        return jsonify({"error": "User not found"}), 404
 
     try:
-        count = count_events_this_week(ical_url)
-        return jsonify({"count": count})
-    except Exception as e:
-        # Optional: include str(e) while debugging, remove later if you want
-        return jsonify({"error": "invalid or unreachable iCal URL", "details": str(e)}), 400
+        count = count_events_this_week(row["ical_url"])
+        return jsonify({"assignments_this_week": count}), 200
+    except Exception:
+        return jsonify({"error": "Failed to read calendar"}), 500
 
 
-# ---------------- MAIN ---------------- #
-
-# Make sure DB exists whenever the app starts (local or on Render)
-init_db()
+# ---------------- STARTUP ---------------- #
 
 if __name__ == "__main__":
+    init_db()
     app.run(debug=True)
