@@ -6,21 +6,19 @@ import re
 from datetime import datetime, timedelta
 import requests
 from icalendar import Calendar
+import pytz
 
 app = Flask(__name__)
 CORS(app, origins="*")
 
 DB_PATH = "helpdeskbot.db"
 MIAMI_EMAIL_REGEX = r"^[a-z][a-z0-9]{2,24}@miamioh\.edu$"
-
-
-# ---------------- DATABASE ---------------- #
+EASTERN_TZ = pytz.timezone("America/New_York")
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 def init_db():
     conn = get_db()
@@ -36,22 +34,20 @@ def init_db():
     conn.commit()
     conn.close()
 
-
-# ✅ Run this at import time (works locally AND on Render/Gunicorn)
 init_db()
 
-
-# ---------------- ICAL LOGIC ---------------- #
+def get_current_week_range():
+    today = datetime.now(EASTERN_TZ).date()
+    monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
+    return monday, sunday
 
 def count_events_this_week(ical_url):
     resp = requests.get(ical_url)
     resp.raise_for_status()
 
     cal = Calendar.from_ical(resp.content)
-
-    today = datetime.now().date()
-    monday = today - timedelta(days=today.weekday())
-    sunday = monday + timedelta(days=6)
+    monday, sunday = get_current_week_range()
 
     count = 0
     for component in cal.walk():
@@ -62,9 +58,6 @@ def count_events_this_week(ical_url):
                 count += 1
 
     return count
-
-
-# ---------------- API ROUTES ---------------- #
 
 @app.route("/api/register", methods=["POST"])
 def register():
@@ -97,7 +90,6 @@ def register():
     conn.close()
     return jsonify({"message": "Account created"}), 201
 
-
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.get_json() or {}
@@ -115,7 +107,6 @@ def login():
         return jsonify({"error": "Invalid login"}), 401
 
     return jsonify({"message": "Login successful"}), 200
-
 
 @app.route("/api/assignments/week", methods=["POST"])
 def assignments_week():
@@ -138,10 +129,6 @@ def assignments_week():
     except Exception:
         return jsonify({"error": "Failed to read calendar"}), 500
 
-
-# ---------------- LOCAL ONLY ---------------- #
-
 if __name__ == "__main__":
-    # For local testing (already initialized above, but safe to call again)
     init_db()
     app.run(debug=True)
