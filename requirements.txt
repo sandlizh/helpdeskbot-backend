@@ -4,3 +4,4 @@ Werkzeug
 requests
 icalendar
 gunicorn
+pytz
