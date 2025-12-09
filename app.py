@@ -15,32 +15,39 @@ DB_PATH = "helpdeskbot.db"
 MIAMI_EMAIL_REGEX = r"^[a-z][a-z0-9]{2,24}@miamioh\.edu$"
 EASTERN_TZ = pytz.timezone("America/New_York")
 
+
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def init_db():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             ical_url TEXT NOT NULL
         );
-    """)
+        """
+    )
     conn.commit()
     conn.close()
 
+
 init_db()
+
 
 def get_current_week_range():
     today = datetime.now(EASTERN_TZ).date()
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
     return monday, sunday
+
 
 def count_events_this_week(ical_url):
     resp = requests.get(ical_url)
@@ -53,11 +60,15 @@ def count_events_this_week(ical_url):
     for component in cal.walk():
         if component.name == "VEVENT":
             dtstart = component.get("dtstart").dt
-            event_date = dtstart.date() if hasattr(dtstart, "date") else dtstart
+            if hasattr(dtstart, "date"):
+                event_date = dtstart.date()
+            else:
+                event_date = dtstart
             if monday <= event_date <= sunday:
                 count += 1
 
     return count
+
 
 @app.route("/api/register", methods=["POST"])
 def register():
@@ -80,7 +91,7 @@ def register():
     try:
         cur.execute(
             "INSERT INTO users (email, password_hash, ical_url) VALUES (?, ?, ?)",
-            (email, password_hash, ical_url)
+            (email, password_hash, ical_url),
         )
         conn.commit()
     except sqlite3.IntegrityError:
@@ -89,6 +100,7 @@ def register():
 
     conn.close()
     return jsonify({"message": "Account created"}), 201
+
 
 @app.route("/api/login", methods=["POST"])
 def login():
@@ -107,6 +119,7 @@ def login():
         return jsonify({"error": "Invalid login"}), 401
 
     return jsonify({"message": "Login successful"}), 200
+
 
 @app.route("/api/assignments/week", methods=["POST"])
 def assignments_week():
@@ -128,6 +141,48 @@ def assignments_week():
         return jsonify({"assignments_this_week": count}), 200
     except Exception:
         return jsonify({"error": "Failed to read calendar"}), 500
+
+
+@app.route("/api/debug/user", methods=["GET"])
+def debug_user():
+    email = request.args.get("email", "").strip().lower()
+    if not email:
+        return jsonify({"error": "Missing email"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT email, ical_url FROM users WHERE email = ?", (email,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"error": "User not found"}), 404
+
+    return jsonify(
+        {
+            "email": row["email"],
+            "ical_url": row["ical_url"],
+        }
+    ), 200
+
+
+@app.route("/api/debug/delete_user", methods=["POST"])
+def debug_delete_user():
+    data = request.get_json() or {}
+    email = data.get("email", "").strip().lower()
+
+    if not email:
+        return jsonify({"error": "Missing email"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE email = ?", (email,))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+
+    return jsonify({"deleted": deleted}), 200
+
 
 if __name__ == "__main__":
     init_db()
