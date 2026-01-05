@@ -12,6 +12,7 @@ import secrets
 import hashlib
 import smtplib
 from email.message import EmailMessage
+import traceback  # ✅ added
 
 app = Flask(__name__)
 CORS(app, origins="*")
@@ -191,6 +192,9 @@ def register():
     try:
         send_verification_email(email, verify_link)
     except Exception as e:
+        # ✅ Print full error to Render logs so we can see the REAL reason
+        print("EMAIL SEND FAILED:", repr(e))
+        traceback.print_exc()
         return jsonify({"error": f"Account created but verification email failed: {str(e)}"}), 500
 
     return jsonify({"message": "Account created. Check your email to verify your account."}), 201
