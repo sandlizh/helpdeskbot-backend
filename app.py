@@ -271,7 +271,8 @@ def login():
     if not user or not check_password_hash(user["password_hash"], password):
         return jsonify({"error": "Invalid login"}), 401
 
-    if user.get("is_verified", 0) == 0:
+    # ✅ FIX: sqlite3.Row has no .get(); access by column name
+    if user["is_verified"] == 0:
         return jsonify({"error": "Email not verified. Check your inbox for the verification link."}), 403
 
     return jsonify({"message": "Login successful"}), 200
@@ -296,6 +297,48 @@ def assignments_week():
         return jsonify({"assignments_this_week": count}), 200
     except Exception:
         return jsonify({"error": "Failed to read calendar"}), 500
+
+
+@app.route("/api/debug/user", methods=["GET"])
+def debug_user():
+    email = request.args.get("email", "").strip().lower()
+    if not email:
+        return jsonify({"error": "Missing email"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT email, ical_url, is_verified FROM users WHERE email = ?", (email,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"error": "User not found"}), 404
+
+    return jsonify(
+        {
+            "email": row["email"],
+            "ical_url": row["ical_url"],
+            "is_verified": row["is_verified"],
+        }
+    ), 200
+
+
+@app.route("/api/debug/delete_user", methods=["POST"])
+def debug_delete_user():
+    data = request.get_json() or {}
+    email = data.get("email", "").strip().lower()
+
+    if not email:
+        return jsonify({"error": "Missing email"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE email = ?", (email,))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+
+    return jsonify({"deleted": deleted}), 200
 
 
 if __name__ == "__main__":
