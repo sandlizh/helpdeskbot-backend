@@ -296,6 +296,30 @@ def assignments_week():
         return jsonify({"error": "Failed to read calendar"}), 500
 
 
+@app.route("/api/debug/user", methods=["GET"])
+def debug_user():
+    email = request.args.get("email", "").strip().lower()
+    if not email:
+        return jsonify({"error": "Missing email"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT email, ical_url, is_verified FROM users WHERE email = ?", (email,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"error": "User not found"}), 404
+
+    return jsonify(
+        {
+            "email": row["email"],
+            "ical_url": row["ical_url"],
+            "is_verified": row["is_verified"],
+        }
+    ), 200
+
+
 @app.route("/api/debug/delete_user", methods=["POST"])
 def debug_delete_user():
     data = request.get_json() or {}
