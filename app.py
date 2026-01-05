@@ -10,9 +10,6 @@ import pytz
 import os
 import secrets
 import hashlib
-import smtplib
-from email.message import EmailMessage
-import traceback  # keep for logging
 
 app = Flask(__name__)
 CORS(app, origins="*")
@@ -21,12 +18,10 @@ DB_PATH = "helpdeskbot.db"
 MIAMI_EMAIL_REGEX = r"^[a-z][a-z0-9]{2,24}@miamioh\.edu$"
 EASTERN_TZ = pytz.timezone("America/New_York")
 
-# ===== Gmail SMTP settings (from Render env vars) =====
-EMAIL_HOST = os.environ.get("EMAIL_HOST", "smtp.gmail.com")
-# ✅ Updated default to 465 (SSL)
-EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465"))
-EMAIL_USER = os.environ.get("EMAIL_USER", "")
-EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
+# ===== Resend settings (HTTP API) =====
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+FROM_EMAIL = os.environ.get("FROM_EMAIL", "")  # e.g. "HelpDeskBot <onboarding@resend.dev>"
+
 APP_PUBLIC_URL = os.environ.get("APP_PUBLIC_URL", "").rstrip("/")
 VERIFY_SECRET = os.environ.get("VERIFY_SECRET", "")
 
@@ -91,29 +86,41 @@ def token_hash(token: str) -> str:
 
 def send_verification_email(to_email: str, verify_link: str):
     """
-    Send email via Gmail SMTP using SSL on port 465.
+    Send email via Resend HTTPS API (works on Render; no SMTP ports needed).
     """
-    if not EMAIL_USER or not EMAIL_PASS or not APP_PUBLIC_URL:
-        raise RuntimeError("Missing EMAIL_USER, EMAIL_PASS, or APP_PUBLIC_URL env vars")
+    if not RESEND_API_KEY:
+        raise RuntimeError("Missing RESEND_API_KEY env var")
+    if not FROM_EMAIL:
+        raise RuntimeError("Missing FROM_EMAIL env var")
+    if not APP_PUBLIC_URL:
+        raise RuntimeError("Missing APP_PUBLIC_URL env var")
 
-    msg = EmailMessage()
-    msg["Subject"] = "Verify your HelpDeskBot account"
-    msg["From"] = f"HelpDeskBot <{EMAIL_USER}>"
-    msg["To"] = to_email
-
-    body = (
+    subject = "Verify your HelpDeskBot account"
+    text_body = (
         "Welcome to HelpDeskBot!\n\n"
         "Please verify your email by clicking this link:\n"
         f"{verify_link}\n\n"
         f"This link expires in {VERIFY_TOKEN_TTL_MINUTES} minutes.\n"
         "If you did not create this account, you can ignore this email."
     )
-    msg.set_content(body)
 
-    # ✅ Updated to SMTP_SSL for port 465
-    with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT, timeout=20) as server:
-        server.login(EMAIL_USER, EMAIL_PASS)
-        server.send_message(msg)
+    resp = requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "subject": subject,
+            "text": text_body,
+        },
+        timeout=20,
+    )
+
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Resend error {resp.status_code}: {resp.text}")
 
 
 def get_current_week_range():
@@ -165,6 +172,7 @@ def register():
     vhash = token_hash(raw_token)
     expires_at = (now_eastern() + timedelta(minutes=VERIFY_TOKEN_TTL_MINUTES)).isoformat()
 
+    # 1) Insert user as unverified
     conn = get_db()
     cur = conn.cursor()
     try:
@@ -179,17 +187,19 @@ def register():
     except sqlite3.IntegrityError:
         conn.close()
         return jsonify({"error": "Email already registered"}), 400
-    conn.close()
 
     verify_link = f"{APP_PUBLIC_URL}/verify.html?token={raw_token}"
 
+    # 2) Send email; if it fails, delete the user so you can retry cleanly
     try:
         send_verification_email(email, verify_link)
     except Exception as e:
-        print("EMAIL SEND FAILED:", repr(e))
-        traceback.print_exc()
-        return jsonify({"error": f"Account created but verification email failed: {str(e)}"}), 500
+        cur.execute("DELETE FROM users WHERE email = ?", (email,))
+        conn.commit()
+        conn.close()
+        return jsonify({"error": f"Registration failed (email not sent): {str(e)}"}), 500
 
+    conn.close()
     return jsonify({"message": "Account created. Check your email to verify your account."}), 201
 
 
@@ -225,7 +235,7 @@ def verify():
     exp_dt = datetime.fromisoformat(expires_at)
     if now_eastern() > exp_dt:
         conn.close()
-        return jsonify({"error": "Verification link expired. Please re-register or request a new link."}), 400
+        return jsonify({"error": "Verification link expired. Please re-register."}), 400
 
     cur.execute(
         """
