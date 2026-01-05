@@ -7,6 +7,11 @@ from datetime import datetime, timedelta
 import requests
 from icalendar import Calendar
 import pytz
+import os
+import secrets
+import hashlib
+import smtplib
+from email.message import EmailMessage
 
 app = Flask(__name__)
 CORS(app, origins="*")
@@ -15,6 +20,16 @@ DB_PATH = "helpdeskbot.db"
 MIAMI_EMAIL_REGEX = r"^[a-z][a-z0-9]{2,24}@miamioh\.edu$"
 EASTERN_TZ = pytz.timezone("America/New_York")
 
+# ===== Gmail SMTP settings (from Render env vars) =====
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
+EMAIL_USER = os.environ.get("EMAIL_USER", "")
+EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
+APP_PUBLIC_URL = os.environ.get("APP_PUBLIC_URL", "").rstrip("/")
+VERIFY_SECRET = os.environ.get("VERIFY_SECRET", "")
+
+VERIFY_TOKEN_TTL_MINUTES = 30
+
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -22,9 +37,14 @@ def get_db():
     return conn
 
 
-def init_db():
+def ensure_users_table_and_columns():
+    """
+    Creates table if missing and adds new columns if table already exists.
+    Safe to run on every startup.
+    """
     conn = get_db()
     cur = conn.cursor()
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -35,22 +55,81 @@ def init_db():
         );
         """
     )
+
+    cur.execute("PRAGMA table_info(users);")
+    cols = {row["name"] for row in cur.fetchall()}
+
+    if "is_verified" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER NOT NULL DEFAULT 0;")
+    if "verify_token_hash" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN verify_token_hash TEXT;")
+    if "verify_expires_at" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN verify_expires_at TEXT;")
+
     conn.commit()
     conn.close()
 
 
-init_db()
+ensure_users_table_and_columns()
+
+
+def now_eastern():
+    return datetime.now(EASTERN_TZ)
+
+
+def sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def make_verify_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def token_hash(token: str) -> str:
+    # hash with secret so tokens can't be used if DB leaked
+    if not VERIFY_SECRET:
+        return sha256_hex(token)
+    return sha256_hex(VERIFY_SECRET + token)
+
+
+def send_verification_email(to_email: str, verify_link: str):
+    """
+    Send email via Gmail SMTP using EMAIL_USER/EMAIL_PASS.
+    """
+    if not EMAIL_USER or not EMAIL_PASS or not APP_PUBLIC_URL:
+        raise RuntimeError("Missing EMAIL_USER, EMAIL_PASS, or APP_PUBLIC_URL env vars")
+
+    msg = EmailMessage()
+    msg["Subject"] = "Verify your HelpDeskBot account"
+    msg["From"] = f"HelpDeskBot <{EMAIL_USER}>"
+    msg["To"] = to_email
+
+    body = (
+        "Welcome to HelpDeskBot!\n\n"
+        "Please verify your email by clicking this link:\n"
+        f"{verify_link}\n\n"
+        f"This link expires in {VERIFY_TOKEN_TTL_MINUTES} minutes.\n"
+        "If you did not create this account, you can ignore this email."
+    )
+    msg.set_content(body)
+
+    with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT, timeout=20) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.send_message(msg)
 
 
 def get_current_week_range():
-    today = datetime.now(EASTERN_TZ).date()
+    today = now_eastern().date()
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
     return monday, sunday
 
 
 def count_events_this_week(ical_url):
-    resp = requests.get(ical_url)
+    resp = requests.get(ical_url, timeout=20)
     resp.raise_for_status()
 
     cal = Calendar.from_ical(resp.content)
@@ -64,6 +143,7 @@ def count_events_this_week(ical_url):
                 event_date = dtstart.date()
             else:
                 event_date = dtstart
+
             if monday <= event_date <= sunday:
                 count += 1
 
@@ -86,20 +166,93 @@ def register():
 
     password_hash = generate_password_hash(password)
 
+    raw_token = make_verify_token()
+    vhash = token_hash(raw_token)
+    expires_at = (now_eastern() + timedelta(minutes=VERIFY_TOKEN_TTL_MINUTES)).isoformat()
+
     conn = get_db()
     cur = conn.cursor()
     try:
         cur.execute(
-            "INSERT INTO users (email, password_hash, ical_url) VALUES (?, ?, ?)",
-            (email, password_hash, ical_url),
+            """
+            INSERT INTO users (email, password_hash, ical_url, is_verified, verify_token_hash, verify_expires_at)
+            VALUES (?, ?, ?, 0, ?, ?)
+            """,
+            (email, password_hash, ical_url, vhash, expires_at),
         )
         conn.commit()
     except sqlite3.IntegrityError:
         conn.close()
         return jsonify({"error": "Email already registered"}), 400
-
     conn.close()
-    return jsonify({"message": "Account created"}), 201
+
+    verify_link = f"{APP_PUBLIC_URL}/verify.html?token={raw_token}"
+
+    try:
+        send_verification_email(email, verify_link)
+    except Exception as e:
+        return jsonify({"error": f"Account created but verification email failed: {str(e)}"}), 500
+
+    return jsonify({"message": "Account created. Check your email to verify your account."}), 201
+
+
+@app.route("/api/verify", methods=["GET"])
+def verify():
+    token = request.args.get("token", "").strip()
+    if not token:
+        return jsonify({"error": "Missing token"}), 400
+
+    vhash = token_hash(token)
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, is_verified, verify_expires_at
+        FROM users
+        WHERE verify_token_hash = ?
+        """,
+        (vhash,),
+    )
+    user = cur.fetchone()
+
+    if not user:
+        conn.close()
+        return jsonify({"error": "Invalid or already used token"}), 400
+
+    if user["is_verified"] == 1:
+        conn.close()
+        return jsonify({"message": "Already verified"}), 200
+
+    expires_at = user["verify_expires_at"]
+    if not expires_at:
+        conn.close()
+        return jsonify({"error": "Verification token missing"}), 400
+
+    try:
+        exp_dt = datetime.fromisoformat(expires_at)
+    except ValueError:
+        conn.close()
+        return jsonify({"error": "Bad expiration format"}), 500
+
+    if now_eastern() > exp_dt:
+        conn.close()
+        return jsonify({"error": "Verification link expired. Please re-register or request a new link."}), 400
+
+    cur.execute(
+        """
+        UPDATE users
+        SET is_verified = 1,
+            verify_token_hash = NULL,
+            verify_expires_at = NULL
+        WHERE id = ?
+        """,
+        (user["id"],),
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({"message": "Email verified. You can now log in."}), 200
 
 
 @app.route("/api/login", methods=["POST"])
@@ -118,13 +271,15 @@ def login():
     if not user or not check_password_hash(user["password_hash"], password):
         return jsonify({"error": "Invalid login"}), 401
 
+    if user.get("is_verified", 0) == 0:
+        return jsonify({"error": "Email not verified. Check your inbox for the verification link."}), 403
+
     return jsonify({"message": "Login successful"}), 200
 
 
 @app.route("/api/assignments/week", methods=["POST"])
 def assignments_week():
     data = request.get_json() or {}
-
     email = data.get("email", "").strip().lower()
 
     conn = get_db()
@@ -143,47 +298,6 @@ def assignments_week():
         return jsonify({"error": "Failed to read calendar"}), 500
 
 
-@app.route("/api/debug/user", methods=["GET"])
-def debug_user():
-    email = request.args.get("email", "").strip().lower()
-    if not email:
-        return jsonify({"error": "Missing email"}), 400
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT email, ical_url FROM users WHERE email = ?", (email,))
-    row = cur.fetchone()
-    conn.close()
-
-    if not row:
-        return jsonify({"error": "User not found"}), 404
-
-    return jsonify(
-        {
-            "email": row["email"],
-            "ical_url": row["ical_url"],
-        }
-    ), 200
-
-
-@app.route("/api/debug/delete_user", methods=["POST"])
-def debug_delete_user():
-    data = request.get_json() or {}
-    email = data.get("email", "").strip().lower()
-
-    if not email:
-        return jsonify({"error": "Missing email"}), 400
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM users WHERE email = ?", (email,))
-    deleted = cur.rowcount
-    conn.commit()
-    conn.close()
-
-    return jsonify({"deleted": deleted}), 200
-
-
 if __name__ == "__main__":
-    init_db()
+    ensure_users_table_and_columns()
     app.run(debug=True)
