@@ -12,7 +12,7 @@ import secrets
 import hashlib
 import smtplib
 from email.message import EmailMessage
-import traceback  # ✅ added
+import traceback  # keep for logging
 
 app = Flask(__name__)
 CORS(app, origins="*")
@@ -23,7 +23,8 @@ EASTERN_TZ = pytz.timezone("America/New_York")
 
 # ===== Gmail SMTP settings (from Render env vars) =====
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "smtp.gmail.com")
-EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
+# ✅ Updated default to 465 (SSL)
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465"))
 EMAIL_USER = os.environ.get("EMAIL_USER", "")
 EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
 APP_PUBLIC_URL = os.environ.get("APP_PUBLIC_URL", "").rstrip("/")
@@ -39,10 +40,6 @@ def get_db():
 
 
 def ensure_users_table_and_columns():
-    """
-    Creates table if missing and adds new columns if table already exists.
-    Safe to run on every startup.
-    """
     conn = get_db()
     cur = conn.cursor()
 
@@ -87,7 +84,6 @@ def make_verify_token() -> str:
 
 
 def token_hash(token: str) -> str:
-    # hash with secret so tokens can't be used if DB leaked
     if not VERIFY_SECRET:
         return sha256_hex(token)
     return sha256_hex(VERIFY_SECRET + token)
@@ -95,7 +91,7 @@ def token_hash(token: str) -> str:
 
 def send_verification_email(to_email: str, verify_link: str):
     """
-    Send email via Gmail SMTP using EMAIL_USER/EMAIL_PASS.
+    Send email via Gmail SMTP using SSL on port 465.
     """
     if not EMAIL_USER or not EMAIL_PASS or not APP_PUBLIC_URL:
         raise RuntimeError("Missing EMAIL_USER, EMAIL_PASS, or APP_PUBLIC_URL env vars")
@@ -114,10 +110,8 @@ def send_verification_email(to_email: str, verify_link: str):
     )
     msg.set_content(body)
 
-    with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT, timeout=20) as server:
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
+    # ✅ Updated to SMTP_SSL for port 465
+    with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT, timeout=20) as server:
         server.login(EMAIL_USER, EMAIL_PASS)
         server.send_message(msg)
 
@@ -192,7 +186,6 @@ def register():
     try:
         send_verification_email(email, verify_link)
     except Exception as e:
-        # ✅ Print full error to Render logs so we can see the REAL reason
         print("EMAIL SEND FAILED:", repr(e))
         traceback.print_exc()
         return jsonify({"error": f"Account created but verification email failed: {str(e)}"}), 500
@@ -211,11 +204,7 @@ def verify():
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        """
-        SELECT id, is_verified, verify_expires_at
-        FROM users
-        WHERE verify_token_hash = ?
-        """,
+        "SELECT id, is_verified, verify_expires_at FROM users WHERE verify_token_hash = ?",
         (vhash,),
     )
     user = cur.fetchone()
@@ -233,12 +222,7 @@ def verify():
         conn.close()
         return jsonify({"error": "Verification token missing"}), 400
 
-    try:
-        exp_dt = datetime.fromisoformat(expires_at)
-    except ValueError:
-        conn.close()
-        return jsonify({"error": "Bad expiration format"}), 500
-
+    exp_dt = datetime.fromisoformat(expires_at)
     if now_eastern() > exp_dt:
         conn.close()
         return jsonify({"error": "Verification link expired. Please re-register or request a new link."}), 400
@@ -275,7 +259,6 @@ def login():
     if not user or not check_password_hash(user["password_hash"], password):
         return jsonify({"error": "Invalid login"}), 401
 
-    # ✅ FIX: sqlite3.Row has no .get(); access by column name
     if user["is_verified"] == 0:
         return jsonify({"error": "Email not verified. Check your inbox for the verification link."}), 403
 
@@ -301,30 +284,6 @@ def assignments_week():
         return jsonify({"assignments_this_week": count}), 200
     except Exception:
         return jsonify({"error": "Failed to read calendar"}), 500
-
-
-@app.route("/api/debug/user", methods=["GET"])
-def debug_user():
-    email = request.args.get("email", "").strip().lower()
-    if not email:
-        return jsonify({"error": "Missing email"}), 400
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT email, ical_url, is_verified FROM users WHERE email = ?", (email,))
-    row = cur.fetchone()
-    conn.close()
-
-    if not row:
-        return jsonify({"error": "User not found"}), 404
-
-    return jsonify(
-        {
-            "email": row["email"],
-            "ical_url": row["ical_url"],
-            "is_verified": row["is_verified"],
-        }
-    ), 200
 
 
 @app.route("/api/debug/delete_user", methods=["POST"])
