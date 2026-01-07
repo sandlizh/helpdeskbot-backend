@@ -20,17 +20,15 @@ MIAMI_EMAIL_REGEX = r"^[a-z][a-z0-9]{2,24}@miamioh\.edu$"
 EASTERN_TZ = pytz.timezone("America/New_York")
 
 # --- Email (HTTP API via Resend) ---
-# Set these in Render environment variables:
-# RESEND_API_KEY   = your key
-# EMAIL_FROM       = something like "HelpDeskBot <onboarding@resend.dev>" (or your verified domain sender)
-# APP_PUBLIC_URL   = "https://sandlizh.github.io/helpdeskbot-frontend/"  (no trailing slash preferred)
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
 EMAIL_FROM = os.getenv("EMAIL_FROM", "").strip()
 APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL", "").strip().rstrip("/")
 
 # --- Canvas ---
-# For MiamiOH Canvas
 CANVAS_BASE_URL = "https://miamioh.instructure.com"
+
+# Canvas types we’ll treat as “assignments”
+ASSIGNMENT_TYPES = {"assignment", "quiz", "discussion_topic"}
 
 
 # ---------------------------
@@ -104,6 +102,24 @@ def get_week_range_datetimes():
     return start_dt, end_dt
 
 
+def get_today_in_eastern():
+    return datetime.now(EASTERN_TZ).date()
+
+
+def get_week_range_for(date_obj):
+    monday = date_obj - timedelta(days=date_obj.weekday())
+    sunday = monday + timedelta(days=6)
+    return monday, sunday
+
+
+def get_next_week_range():
+    today = get_today_in_eastern()
+    this_monday, _ = get_week_range_for(today)
+    next_monday = this_monday + timedelta(days=7)
+    next_sunday = next_monday + timedelta(days=6)
+    return next_monday, next_sunday
+
+
 # ---------------------------
 # iCal counting (fallback)
 # ---------------------------
@@ -143,25 +159,13 @@ def count_ical_events_this_week(ical_url):
 
 
 # ---------------------------
-# Canvas counting (all items + assignments subset)
+# Canvas: fetch + summarize
 # ---------------------------
 
-def count_canvas_items_and_assignments_this_week(canvas_token):
-    """
-    Returns:
-      {
-        "calendar_items_this_week": <int>,   # all Canvas planner items in the week
-        "assignments_this_week": <int>       # only assignments in the week
-      }
-    """
-    start_dt, end_dt = get_week_range_datetimes()
-
-    start_utc = start_dt.astimezone(pytz.utc).isoformat()
-    end_utc = end_dt.astimezone(pytz.utc).isoformat()
-
+def canvas_fetch_planner_items(canvas_token, start_dt_utc_iso, end_dt_utc_iso):
     url = f"{CANVAS_BASE_URL}/api/v1/planner/items"
     headers = {"Authorization": f"Bearer {canvas_token}"}
-    params = {"start_date": start_utc, "end_date": end_utc, "per_page": 100}
+    params = {"start_date": start_dt_utc_iso, "end_date": end_dt_utc_iso, "per_page": 100}
 
     items = []
     next_url = url
@@ -194,11 +198,20 @@ def count_canvas_items_and_assignments_this_week(canvas_token):
                         next_link = seg[1:-1]
         next_url = next_link
 
-    total_items = 0
-    assignment_items = 0
+    return items
+
+
+def summarize_canvas_items(items, start_dt, end_dt):
+    """
+    Returns:
+      calendar_items: all items in range
+      assignments: only assignment-like types (assignment/quiz/discussion_topic)
+      assignment_items: list with title/course/type/due_at/url
+    """
+    calendar_count = 0
+    assignment_list = []
 
     for it in items:
-        # planner date fields vary
         due_at = (
             it.get("plannable_date")
             or it.get("due_at")
@@ -218,14 +231,45 @@ def count_canvas_items_and_assignments_this_week(canvas_token):
 
         due_eastern = due_dt.astimezone(EASTERN_TZ)
 
-        if start_dt <= due_eastern <= end_dt:
-            total_items += 1
-            if (it.get("plannable_type") or "").lower() == "assignment":
-                assignment_items += 1
+        if not (start_dt <= due_eastern <= end_dt):
+            continue
+
+        calendar_count += 1
+
+        ptype = (it.get("plannable_type") or "").lower()
+        if ptype in ASSIGNMENT_TYPES:
+            title = it.get("plannable", {}).get("title") or it.get("title") or "Untitled"
+            course = it.get("context_name") or "Canvas"
+            url = it.get("html_url") or it.get("plannable", {}).get("html_url")
+
+            assignment_list.append({
+                "title": title,
+                "course": course,
+                "type": ptype,
+                "due_at": due_dt.astimezone(EASTERN_TZ).isoformat(),
+                "url": url
+            })
+
+    assignment_list.sort(key=lambda x: x.get("due_at") or "9999-12-31T23:59:59-05:00")
 
     return {
-        "calendar_items_this_week": total_items,
-        "assignments_this_week": assignment_items
+        "calendar_items": calendar_count,
+        "assignments": len(assignment_list),
+        "assignment_items": assignment_list
+    }
+
+
+def count_canvas_items_and_assignments_this_week(canvas_token):
+    start_dt, end_dt = get_week_range_datetimes()
+    start_utc = start_dt.astimezone(pytz.utc).isoformat()
+    end_utc = end_dt.astimezone(pytz.utc).isoformat()
+
+    items = canvas_fetch_planner_items(canvas_token, start_utc, end_utc)
+    summary = summarize_canvas_items(items, start_dt, end_dt)
+
+    return {
+        "calendar_items_this_week": summary["calendar_items"],
+        "assignments_this_week": summary["assignments"]
     }
 
 
@@ -234,9 +278,6 @@ def count_canvas_items_and_assignments_this_week(canvas_token):
 # ---------------------------
 
 def send_verification_email(to_email, verify_link):
-    """
-    Sends email via Resend HTTP API.
-    """
     if not RESEND_API_KEY or not EMAIL_FROM or not APP_PUBLIC_URL:
         raise RuntimeError("Email env vars missing (RESEND_API_KEY, EMAIL_FROM, APP_PUBLIC_URL).")
 
@@ -309,13 +350,11 @@ def register():
 
     conn.close()
 
-    # Build verify URL on backend, then redirect user back to frontend login
     verify_link = f"https://helpdeskbot-backend.onrender.com/api/verify?token={verify_token}"
 
     try:
         send_verification_email(email, verify_link)
     except Exception as e:
-        # If email fails, user is created but not verified
         return jsonify({"error": f"Account created but email failed to send: {str(e)}"}), 500
 
     return jsonify({"message": "Account created. Please verify your email."}), 201
@@ -363,7 +402,6 @@ def verify():
     conn.commit()
     conn.close()
 
-    # Redirect to your frontend login page
     if APP_PUBLIC_URL:
         return redirect(f"{APP_PUBLIC_URL}/index.html")
     return jsonify({"message": "Verified. You may now log in."}), 200
@@ -432,7 +470,6 @@ def assignments_week():
     if not row:
         return jsonify({"error": "User not found"}), 404
 
-    # Prefer Canvas if connected
     if row["canvas_token"]:
         try:
             counts = count_canvas_items_and_assignments_this_week(row["canvas_token"])
@@ -442,7 +479,6 @@ def assignments_week():
                 "source": "canvas"
             }), 200
         except Exception as e:
-            # fallback to iCal
             try:
                 ical_count = count_ical_events_this_week(row["ical_url"])
                 return jsonify({
@@ -454,7 +490,6 @@ def assignments_week():
             except Exception:
                 return jsonify({"error": "Failed to read Canvas and iCal"}), 500
 
-    # If no Canvas token, use iCal
     try:
         ical_count = count_ical_events_this_week(row["ical_url"])
         return jsonify({
@@ -464,6 +499,149 @@ def assignments_week():
         }), 200
     except Exception:
         return jsonify({"error": "Failed to read calendar"}), 500
+
+
+# ---------------------------
+# NEW: Assignments overview + list endpoints
+# ---------------------------
+
+@app.post("/api/assignments/overview")
+def assignments_overview():
+    data = request.get_json() or {}
+    email = (data.get("email") or "").strip().lower()
+
+    if not email:
+        return jsonify({"error": "Missing email"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT canvas_token FROM users WHERE email = ?", (email,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row or not row["canvas_token"]:
+        return jsonify({"error": "Canvas token not set for user"}), 400
+
+    token = row["canvas_token"]
+
+    try:
+        today = get_today_in_eastern()
+        tomorrow = today + timedelta(days=1)
+
+        this_monday, this_sunday = get_week_range_for(today)
+        next_monday, next_sunday = get_next_week_range()
+
+        # Build big range: today -> next week Sunday
+        start_dt = EASTERN_TZ.localize(datetime(today.year, today.month, today.day, 0, 0, 0))
+        end_dt = EASTERN_TZ.localize(datetime(next_sunday.year, next_sunday.month, next_sunday.day, 23, 59, 59))
+
+        items = canvas_fetch_planner_items(
+            token,
+            start_dt.astimezone(pytz.utc).isoformat(),
+            end_dt.astimezone(pytz.utc).isoformat()
+        )
+
+        def summarize_for_day(d):
+            s = EASTERN_TZ.localize(datetime(d.year, d.month, d.day, 0, 0, 0))
+            e = EASTERN_TZ.localize(datetime(d.year, d.month, d.day, 23, 59, 59))
+            return summarize_canvas_items(items, s, e)
+
+        def summarize_for_week(monday, sunday):
+            s = EASTERN_TZ.localize(datetime(monday.year, monday.month, monday.day, 0, 0, 0))
+            e = EASTERN_TZ.localize(datetime(sunday.year, sunday.month, sunday.day, 23, 59, 59))
+            return summarize_canvas_items(items, s, e)
+
+        today_sum = summarize_for_day(today)
+        tomorrow_sum = summarize_for_day(tomorrow)
+        this_week_sum = summarize_for_week(this_monday, this_sunday)
+        next_week_sum = summarize_for_week(next_monday, next_sunday)
+
+        # Next 5 upcoming assignments from today -> next week
+        big_sum = summarize_canvas_items(items, start_dt, end_dt)
+        upcoming = big_sum["assignment_items"][:5]
+
+        return jsonify({
+            "source": "canvas",
+            "today": {
+                "calendar_items": today_sum["calendar_items"],
+                "assignments": today_sum["assignments"],
+                "date": str(today),
+            },
+            "tomorrow": {
+                "calendar_items": tomorrow_sum["calendar_items"],
+                "assignments": tomorrow_sum["assignments"],
+                "date": str(tomorrow),
+            },
+            "this_week": {
+                "calendar_items": this_week_sum["calendar_items"],
+                "assignments": this_week_sum["assignments"],
+                "start": str(this_monday),
+                "end": str(this_sunday),
+            },
+            "next_week": {
+                "calendar_items": next_week_sum["calendar_items"],
+                "assignments": next_week_sum["assignments"],
+                "start": str(next_monday),
+                "end": str(next_sunday),
+            },
+            "upcoming_assignments": upcoming
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": f"Canvas request failed: {str(e)}"}), 500
+
+
+@app.post("/api/assignments/list")
+def assignments_list():
+    """
+    Body:
+      { "email": "...", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD" }
+    Returns assignment-like items list and counts
+    """
+    data = request.get_json() or {}
+    email = (data.get("email") or "").strip().lower()
+    start_date = (data.get("start_date") or "").strip()
+    end_date = (data.get("end_date") or "").strip()
+
+    if not email or not start_date or not end_date:
+        return jsonify({"error": "Missing email/start_date/end_date"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT canvas_token FROM users WHERE email = ?", (email,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row or not row["canvas_token"]:
+        return jsonify({"error": "Canvas token not set for user"}), 400
+
+    token = row["canvas_token"]
+
+    try:
+        # make eastern day bounds
+        sd = dtparser.isoparse(start_date).date()
+        ed = dtparser.isoparse(end_date).date()
+
+        start_dt = EASTERN_TZ.localize(datetime(sd.year, sd.month, sd.day, 0, 0, 0))
+        end_dt = EASTERN_TZ.localize(datetime(ed.year, ed.month, ed.day, 23, 59, 59))
+
+        items = canvas_fetch_planner_items(
+            token,
+            start_dt.astimezone(pytz.utc).isoformat(),
+            end_dt.astimezone(pytz.utc).isoformat()
+        )
+
+        summary = summarize_canvas_items(items, start_dt, end_dt)
+
+        return jsonify({
+            "source": "canvas",
+            "calendar_items_this_range": summary["calendar_items"],
+            "assignments_this_range": summary["assignments"],
+            "items": summary["assignment_items"]
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": f"Canvas request failed: {str(e)}"}), 500
 
 
 # ---------------------------
