@@ -80,7 +80,7 @@ def init_db():
     if not column_exists(conn, "users", "canvas_token"):
         cur.execute("ALTER TABLE users ADD COLUMN canvas_token TEXT;")
 
-    # If the original table didn't have ical_url nullable, we still insert "N/A" to avoid NOT NULL issues.
+    # If the original table didn't have ical_url, add it
     if not column_exists(conn, "users", "ical_url"):
         cur.execute("ALTER TABLE users ADD COLUMN ical_url TEXT;")
 
@@ -203,7 +203,6 @@ def count_canvas_items_and_assignments(canvas_token, start_dt, end_dt):
     assignment_items = 0
 
     for it in items:
-        # date field variants
         due_at = (
             it.get("plannable_date")
             or it.get("due_at")
@@ -231,6 +230,81 @@ def count_canvas_items_and_assignments(canvas_token, start_dt, end_dt):
     return {
         "calendar_items": total_items,
         "assignments": assignment_items
+    }
+
+
+def list_canvas_items_in_range(canvas_token, start_dt, end_dt):
+    """
+    Returns a normalized list of items in the range + counts.
+    Each item includes title/type/due date (local)/url when available.
+    """
+    items = _canvas_fetch_planner_items(canvas_token, start_dt, end_dt)
+
+    normalized = []
+    total_items = 0
+    assignment_items = 0
+
+    for it in items:
+        due_at = (
+            it.get("plannable_date")
+            or it.get("due_at")
+            or it.get("planner_override", {}).get("plannable_date")
+            or it.get("planner_override", {}).get("due_at")
+        )
+        if not due_at:
+            continue
+
+        try:
+            due_dt = dtparser.isoparse(due_at)
+        except Exception:
+            continue
+
+        if due_dt.tzinfo is None:
+            due_dt = pytz.utc.localize(due_dt)
+
+        due_eastern = due_dt.astimezone(EASTERN_TZ)
+
+        if not (start_dt <= due_eastern <= end_dt):
+            continue
+
+        total_items += 1
+
+        ptype = (it.get("plannable_type") or "").lower()
+        is_assignment = (ptype == "assignment")
+        if is_assignment:
+            assignment_items += 1
+
+        title = (
+            it.get("plannable", {}).get("title")
+            or it.get("plannable", {}).get("name")
+            or it.get("title")
+            or it.get("context_name")
+            or "Untitled"
+        )
+
+        # Try to capture a link (Canvas often provides html_url, but not always)
+        html_url = (
+            it.get("html_url")
+            or it.get("plannable", {}).get("html_url")
+            or it.get("plannable", {}).get("url")
+            or ""
+        )
+
+        normalized.append({
+            "title": title,
+            "type": ptype or "item",
+            "due_at": due_dt.isoformat(),
+            "due_at_local": due_eastern.strftime("%Y-%m-%d %I:%M %p ET"),
+            "url": html_url
+        })
+
+    # Sort by due date
+    normalized.sort(key=lambda x: x.get("due_at", ""))
+
+    return {
+        "calendar_items": total_items,
+        "assignments": assignment_items,
+        "items": normalized
     }
 
 
@@ -500,6 +574,55 @@ def assignments_overview():
         },
         "source": "canvas"
     }), 200
+
+
+# ✅ NEW: list items by scope (today/tomorrow/this_week/next_week)
+@app.post("/api/assignments/list_by_scope")
+def assignments_list_by_scope():
+    data = request.get_json() or {}
+    email = (data.get("email") or "").strip().lower()
+    scope = (data.get("scope") or "this_week").strip().lower()
+
+    if not email:
+        return jsonify({"error": "Missing email"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT canvas_token FROM users WHERE email = ?", (email,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"error": "User not found"}), 404
+
+    if not row["canvas_token"]:
+        return jsonify({"error": "Canvas not connected"}), 400
+
+    # Choose range based on scope
+    if scope == "today":
+        start_dt, end_dt = get_today_range()
+    elif scope == "tomorrow":
+        start_dt, end_dt = get_tomorrow_range()
+    elif scope == "next_week":
+        start_dt, end_dt = get_next_week_range()
+    else:
+        scope = "this_week"
+        start_dt, end_dt = get_this_week_range()
+
+    try:
+        result = list_canvas_items_in_range(row["canvas_token"], start_dt, end_dt)
+
+        return jsonify({
+            "scope": scope,
+            "start": start_dt.date().isoformat(),
+            "end": end_dt.date().isoformat(),
+            "calendar_items": result["calendar_items"],
+            "assignments": result["assignments"],
+            "items": result["items"],
+            "source": "canvas"
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------------------------
