@@ -313,16 +313,30 @@ def list_canvas_items_in_range(canvas_token, start_dt, end_dt):
 # ---------------------------
 
 def send_verification_email(to_email, verify_link):
+    """
+    Sends email via Resend HTTP API.
+    NOTE: We intentionally DO NOT use <a href="..."> to avoid link tracking rewriting
+    verification links (which can break verification).
+    """
     if not RESEND_API_KEY or not EMAIL_FROM or not APP_PUBLIC_URL:
         raise RuntimeError("Email env vars missing (RESEND_API_KEY, EMAIL_FROM, APP_PUBLIC_URL).")
 
     subject = "Verify your HelpDeskBot account"
+
+    # Plain-text style link (no anchor tag)
     html = f"""
       <p>Hi!</p>
-      <p>Please verify your HelpDeskBot account by clicking this link:</p>
-      <p><a href="{verify_link}">{verify_link}</a></p>
+      <p>Please verify your HelpDeskBot account by copying and pasting this link into your browser:</p>
+      <p><code style="word-break: break-all;">{verify_link}</code></p>
       <p>If you didn’t sign up, you can ignore this email.</p>
     """
+
+    text = (
+        "Hi!\n\n"
+        "Please verify your HelpDeskBot account by copying and pasting this link into your browser:\n\n"
+        f"{verify_link}\n\n"
+        "If you didn’t sign up, you can ignore this email.\n"
+    )
 
     resp = requests.post(
         "https://api.resend.com/emails",
@@ -334,7 +348,8 @@ def send_verification_email(to_email, verify_link):
             "from": EMAIL_FROM,
             "to": [to_email],
             "subject": subject,
-            "html": html
+            "html": html,
+            "text": text
         },
         timeout=25
     )
