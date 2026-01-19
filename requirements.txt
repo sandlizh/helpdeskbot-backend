@@ -2,7 +2,6 @@ Flask
 Flask-Cors
 Werkzeug
 requests
-icalendar
 gunicorn
 pytz
 python-dateutil
