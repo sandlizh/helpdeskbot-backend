@@ -18,22 +18,12 @@ DB_PATH = "helpdeskbot.db"
 MIAMI_EMAIL_REGEX = r"^[a-z][a-z0-9]{2,24}@miamioh\.edu$"
 EASTERN_TZ = pytz.timezone("America/New_York")
 
-# --- Email (HTTP API via Resend) ---
-# Set these in Render environment variables:
-# RESEND_API_KEY   = your key
-# EMAIL_FROM       = e.g. "HelpDeskBot <onboarding@resend.dev>" (or your verified sender)
-# APP_PUBLIC_URL   = "https://sandlizh.github.io/helpdeskbot-frontend"  (no trailing slash)
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
 EMAIL_FROM = os.getenv("EMAIL_FROM", "").strip()
 APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL", "").strip().rstrip("/")
 
-# --- Canvas ---
 CANVAS_BASE_URL = "https://miamioh.instructure.com"
 
-
-# ---------------------------
-# DB helpers / migrations
-# ---------------------------
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -52,9 +42,8 @@ def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    # NOTE: Keep ical_url column for compatibility, but we won't use it anymore.
-    # Make it nullable in the CREATE (existing DBs may still have NOT NULL).
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE NOT NULL,
@@ -65,9 +54,9 @@ def init_db():
             verify_token_expires TEXT,
             canvas_token TEXT
         );
-    """)
+        """
+    )
 
-    # Simple migrations for older DBs (adds missing columns if needed)
     if not column_exists(conn, "users", "is_verified"):
         cur.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 0;")
 
@@ -80,7 +69,6 @@ def init_db():
     if not column_exists(conn, "users", "canvas_token"):
         cur.execute("ALTER TABLE users ADD COLUMN canvas_token TEXT;")
 
-    # If the original table didn't have ical_url, add it
     if not column_exists(conn, "users", "ical_url"):
         cur.execute("ALTER TABLE users ADD COLUMN ical_url TEXT;")
 
@@ -91,10 +79,6 @@ def init_db():
 init_db()
 
 
-# ---------------------------
-# Date helpers (Eastern)
-# ---------------------------
-
 def _localize_eastern(y, m, d, hh=0, mm=0, ss=0):
     return EASTERN_TZ.localize(datetime(y, m, d, hh, mm, ss))
 
@@ -102,54 +86,43 @@ def _localize_eastern(y, m, d, hh=0, mm=0, ss=0):
 def get_today_range():
     now = datetime.now(EASTERN_TZ)
     d = now.date()
-    start_dt = _localize_eastern(d.year, d.month, d.day, 0, 0, 0)
-    end_dt = _localize_eastern(d.year, d.month, d.day, 23, 59, 59)
-    return start_dt, end_dt
+    return (
+        _localize_eastern(d.year, d.month, d.day, 0, 0, 0),
+        _localize_eastern(d.year, d.month, d.day, 23, 59, 59),
+    )
 
 
 def get_tomorrow_range():
     now = datetime.now(EASTERN_TZ)
     d = (now + timedelta(days=1)).date()
-    start_dt = _localize_eastern(d.year, d.month, d.day, 0, 0, 0)
-    end_dt = _localize_eastern(d.year, d.month, d.day, 23, 59, 59)
-    return start_dt, end_dt
+    return (
+        _localize_eastern(d.year, d.month, d.day, 0, 0, 0),
+        _localize_eastern(d.year, d.month, d.day, 23, 59, 59),
+    )
 
 
 def get_this_week_range():
-    """
-    Monday 00:00:00 -> Sunday 23:59:59 (Eastern)
-    """
     now = datetime.now(EASTERN_TZ)
     today = now.date()
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
-
-    start_dt = _localize_eastern(monday.year, monday.month, monday.day, 0, 0, 0)
-    end_dt = _localize_eastern(sunday.year, sunday.month, sunday.day, 23, 59, 59)
-    return start_dt, end_dt
+    return (
+        _localize_eastern(monday.year, monday.month, monday.day, 0, 0, 0),
+        _localize_eastern(sunday.year, sunday.month, sunday.day, 23, 59, 59),
+    )
 
 
 def get_next_week_range():
-    """
-    Next Monday 00:00:00 -> Next Sunday 23:59:59 (Eastern)
-    """
     this_start, _ = get_this_week_range()
     next_monday = (this_start + timedelta(days=7)).date()
     next_sunday = next_monday + timedelta(days=6)
+    return (
+        _localize_eastern(next_monday.year, next_monday.month, next_monday.day, 0, 0, 0),
+        _localize_eastern(next_sunday.year, next_sunday.month, next_sunday.day, 23, 59, 59),
+    )
 
-    start_dt = _localize_eastern(next_monday.year, next_monday.month, next_monday.day, 0, 0, 0)
-    end_dt = _localize_eastern(next_sunday.year, next_sunday.month, next_sunday.day, 23, 59, 59)
-    return start_dt, end_dt
-
-
-# ---------------------------
-# Canvas helpers
-# ---------------------------
 
 def _canvas_fetch_planner_items(canvas_token, start_dt_eastern, end_dt_eastern):
-    """
-    Fetches Canvas planner items for a date range (returns list of items).
-    """
     start_utc = start_dt_eastern.astimezone(pytz.utc).isoformat()
     end_utc = end_dt_eastern.astimezone(pytz.utc).isoformat()
 
@@ -165,7 +138,7 @@ def _canvas_fetch_planner_items(canvas_token, start_dt_eastern, end_dt_eastern):
             next_url,
             headers=headers,
             params=params if next_url == url else None,
-            timeout=20
+            timeout=20,
         )
 
         if r.status_code == 401:
@@ -177,7 +150,6 @@ def _canvas_fetch_planner_items(canvas_token, start_dt_eastern, end_dt_eastern):
         if isinstance(batch, list):
             items.extend(batch)
 
-        # pagination
         link = r.headers.get("Link", "")
         next_link = None
         if link:
@@ -192,11 +164,6 @@ def _canvas_fetch_planner_items(canvas_token, start_dt_eastern, end_dt_eastern):
 
 
 def count_canvas_items_and_assignments(canvas_token, start_dt, end_dt):
-    """
-    Counts:
-      - all planner items in range
-      - assignment planner items in range
-    """
     items = _canvas_fetch_planner_items(canvas_token, start_dt, end_dt)
 
     total_items = 0
@@ -227,17 +194,10 @@ def count_canvas_items_and_assignments(canvas_token, start_dt, end_dt):
             if (it.get("plannable_type") or "").lower() == "assignment":
                 assignment_items += 1
 
-    return {
-        "calendar_items": total_items,
-        "assignments": assignment_items
-    }
+    return {"calendar_items": total_items, "assignments": assignment_items}
 
 
 def list_canvas_items_in_range(canvas_token, start_dt, end_dt):
-    """
-    Returns a normalized list of items in the range + counts.
-    Each item includes title/type/due date (local)/url when available.
-    """
     items = _canvas_fetch_planner_items(canvas_token, start_dt, end_dt)
 
     normalized = []
@@ -270,7 +230,7 @@ def list_canvas_items_in_range(canvas_token, start_dt, end_dt):
         total_items += 1
 
         ptype = (it.get("plannable_type") or "").lower()
-        is_assignment = (ptype == "assignment")
+        is_assignment = ptype == "assignment"
         if is_assignment:
             assignment_items += 1
 
@@ -282,7 +242,6 @@ def list_canvas_items_in_range(canvas_token, start_dt, end_dt):
             or "Untitled"
         )
 
-        # Try to capture a link (Canvas often provides html_url, but not always)
         html_url = (
             it.get("html_url")
             or it.get("plannable", {}).get("html_url")
@@ -290,40 +249,31 @@ def list_canvas_items_in_range(canvas_token, start_dt, end_dt):
             or ""
         )
 
-        normalized.append({
-            "title": title,
-            "type": ptype or "item",
-            "due_at": due_dt.isoformat(),
-            "due_at_local": due_eastern.strftime("%Y-%m-%d %I:%M %p ET"),
-            "url": html_url
-        })
+        normalized.append(
+            {
+                "title": title,
+                "type": ptype or "item",
+                "due_at": due_dt.isoformat(),
+                "due_at_local": due_eastern.strftime("%Y-%m-%d %I:%M %p ET"),
+                "url": html_url,
+            }
+        )
 
-    # Sort by due date
     normalized.sort(key=lambda x: x.get("due_at", ""))
 
     return {
         "calendar_items": total_items,
         "assignments": assignment_items,
-        "items": normalized
+        "items": normalized,
     }
 
 
-# ---------------------------
-# Email verification (Resend)
-# ---------------------------
-
 def send_verification_email(to_email, verify_link):
-    """
-    Sends email via Resend HTTP API.
-    NOTE: We intentionally DO NOT use <a href="..."> to avoid link tracking rewriting
-    verification links (which can break verification).
-    """
     if not RESEND_API_KEY or not EMAIL_FROM or not APP_PUBLIC_URL:
         raise RuntimeError("Email env vars missing (RESEND_API_KEY, EMAIL_FROM, APP_PUBLIC_URL).")
 
     subject = "Verify your HelpDeskBot account"
 
-    # Plain-text style link (no anchor tag)
     html = f"""
       <p>Hi!</p>
       <p>Please verify your HelpDeskBot account by copying and pasting this link into your browser:</p>
@@ -340,34 +290,20 @@ def send_verification_email(to_email, verify_link):
 
     resp = requests.post(
         "https://api.resend.com/emails",
-        headers={
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "from": EMAIL_FROM,
-            "to": [to_email],
-            "subject": subject,
-            "html": html,
-            "text": text
-        },
-        timeout=25
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+        json={"from": EMAIL_FROM, "to": [to_email], "subject": subject, "html": html, "text": text},
+        timeout=25,
     )
 
     if resp.status_code >= 400:
         raise RuntimeError(f"Email send failed: {resp.status_code} {resp.text[:200]}")
 
 
-# ---------------------------
-# Routes
-# ---------------------------
-
 @app.get("/")
 def health():
     return jsonify({"status": "ok"}), 200
 
 
-# ✅ Canvas-first registration: requires canvas_token, no iCal required
 @app.post("/api/register")
 def register():
     data = request.get_json() or {}
@@ -390,11 +326,13 @@ def register():
     cur = conn.cursor()
 
     try:
-        # ical_url saved as placeholder for compatibility
-        cur.execute("""
+        cur.execute(
+            """
             INSERT INTO users (email, password_hash, ical_url, canvas_token, is_verified, verify_token, verify_token_expires)
             VALUES (?, ?, ?, ?, 0, ?, ?)
-        """, (email, password_hash, "N/A", canvas_token, verify_token, expires.isoformat()))
+            """,
+            (email, password_hash, "N/A", canvas_token, verify_token, expires.isoformat()),
+        )
         conn.commit()
     except sqlite3.IntegrityError:
         conn.close()
@@ -444,13 +382,16 @@ def verify():
             conn.close()
             return jsonify({"error": "Token expired"}), 400
 
-    cur.execute("""
+    cur.execute(
+        """
         UPDATE users
         SET is_verified = 1,
             verify_token = NULL,
             verify_token_expires = NULL
         WHERE id = ?
-    """, (row["id"],))
+        """,
+        (row["id"],),
+    )
     conn.commit()
     conn.close()
 
@@ -481,7 +422,6 @@ def login():
     return jsonify({"message": "Login successful"}), 200
 
 
-# Optional: allow user to update canvas token later
 @app.post("/api/canvas/token")
 def canvas_token():
     data = request.get_json() or {}
@@ -506,7 +446,6 @@ def canvas_token():
     return jsonify({"message": "Canvas token saved"}), 200
 
 
-# ✅ Canvas-only: weekly counts
 @app.post("/api/assignments/week")
 def assignments_week():
     data = request.get_json() or {}
@@ -530,14 +469,15 @@ def assignments_week():
     start_dt, end_dt = get_this_week_range()
     counts = count_canvas_items_and_assignments(row["canvas_token"], start_dt, end_dt)
 
-    return jsonify({
-        "calendar_items_this_week": counts["calendar_items"],
-        "assignments_this_week": counts["assignments"],
-        "source": "canvas"
-    }), 200
+    return jsonify(
+        {
+            "calendar_items_this_week": counts["calendar_items"],
+            "assignments_this_week": counts["assignments"],
+            "source": "canvas",
+        }
+    ), 200
 
 
-# ✅ Canvas-only: today / tomorrow / this week / next week counts
 @app.post("/api/assignments/overview")
 def assignments_overview():
     data = request.get_json() or {}
@@ -570,28 +510,26 @@ def assignments_overview():
     this_week_counts = count_canvas_items_and_assignments(token, w0, w1)
     next_week_counts = count_canvas_items_and_assignments(token, nw0, nw1)
 
-    return jsonify({
-        "today": {
-            "calendar_items": today_counts["calendar_items"],
-            "assignments": today_counts["assignments"]
-        },
-        "tomorrow": {
-            "calendar_items": tomorrow_counts["calendar_items"],
-            "assignments": tomorrow_counts["assignments"]
-        },
-        "this_week": {
-            "calendar_items": this_week_counts["calendar_items"],
-            "assignments": this_week_counts["assignments"]
-        },
-        "next_week": {
-            "calendar_items": next_week_counts["calendar_items"],
-            "assignments": next_week_counts["assignments"]
-        },
-        "source": "canvas"
-    }), 200
+    return jsonify(
+        {
+            "today": {"calendar_items": today_counts["calendar_items"], "assignments": today_counts["assignments"]},
+            "tomorrow": {
+                "calendar_items": tomorrow_counts["calendar_items"],
+                "assignments": tomorrow_counts["assignments"],
+            },
+            "this_week": {
+                "calendar_items": this_week_counts["calendar_items"],
+                "assignments": this_week_counts["assignments"],
+            },
+            "next_week": {
+                "calendar_items": next_week_counts["calendar_items"],
+                "assignments": next_week_counts["assignments"],
+            },
+            "source": "canvas",
+        }
+    ), 200
 
 
-# ✅ NEW: list items by scope (today/tomorrow/this_week/next_week)
 @app.post("/api/assignments/list_by_scope")
 def assignments_list_by_scope():
     data = request.get_json() or {}
@@ -613,7 +551,6 @@ def assignments_list_by_scope():
     if not row["canvas_token"]:
         return jsonify({"error": "Canvas not connected"}), 400
 
-    # Choose range based on scope
     if scope == "today":
         start_dt, end_dt = get_today_range()
     elif scope == "tomorrow":
@@ -626,23 +563,20 @@ def assignments_list_by_scope():
 
     try:
         result = list_canvas_items_in_range(row["canvas_token"], start_dt, end_dt)
-
-        return jsonify({
-            "scope": scope,
-            "start": start_dt.date().isoformat(),
-            "end": end_dt.date().isoformat(),
-            "calendar_items": result["calendar_items"],
-            "assignments": result["assignments"],
-            "items": result["items"],
-            "source": "canvas"
-        }), 200
+        return jsonify(
+            {
+                "scope": scope,
+                "start": start_dt.date().isoformat(),
+                "end": end_dt.date().isoformat(),
+                "calendar_items": result["calendar_items"],
+                "assignments": result["assignments"],
+                "items": result["items"],
+                "source": "canvas",
+            }
+        ), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-# ---------------------------
-# Debug routes (optional)
-# ---------------------------
 
 @app.get("/api/debug/user")
 def debug_user():
@@ -659,11 +593,13 @@ def debug_user():
     if not row:
         return jsonify({"error": "User not found"}), 404
 
-    return jsonify({
-        "email": row["email"],
-        "is_verified": int(row["is_verified"] or 0),
-        "has_canvas_token": bool(row["canvas_token"])
-    }), 200
+    return jsonify(
+        {
+            "email": row["email"],
+            "is_verified": int(row["is_verified"] or 0),
+            "has_canvas_token": bool(row["canvas_token"]),
+        }
+    ), 200
 
 
 @app.post("/api/debug/delete_user")
